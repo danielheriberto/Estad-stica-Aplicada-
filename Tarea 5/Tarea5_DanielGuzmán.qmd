@@ -1,0 +1,426 @@
+---
+title: "Análisis Revisado: Finanzas Públicas Estatales en México (2013–2023)"
+format: 
+  html:
+    grid: 
+      body-width: 1000px
+editor: visual
+---
+
+```{=html}
+<style>
+main.content {
+  text-align: justify;
+}
+</style>
+```
+
+```{r}
+#| code-fold: true
+#| message: false
+#| warning: false
+
+# Librerías principales
+library(tidyverse)
+library(RColorBrewer)
+library(sf)          
+library(viridis)    
+library(DT)
+library(plotly)
+library(knitr)
+library(kableExtra)
+library(corrplot)
+library(broom)
+library(scales)
+library(multcomp)
+library(dplyr)
+
+
+
+```
+
+# Presentación
+
+Este estudio realiza un examen de los gastos públicos registrados en la EFIPEM durante el período 2013 a 2023. Su finalidad es analizar la composición del gasto, establecer comparaciones entre diferentes estados y años, y consolidar la información para destacar con precisión los aspectos que se detallan más adelante.
+
+La metodología se describe en las siguientes secciones, donde se detalla la preparación de los datos, se incluyen representaciones gráficas y se aplican análisis estadísticos con el propósito de clarificar cómo se distribuye el gasto público en las entidades federativas de México.
+
+# Marco de clasificación del gasto
+
+Siguiendo la estructura del INEGI, el gasto estatal se organiza en categorías que permiten rastrear el uso de los recursos. En términos generales, se identifican las siguientes partidas principales:
+
+-   Transferencias y subsidios (dirigidos a terceros y organismos).
+
+-   Remuneraciones al personal (sueldos y prestaciones).
+
+-   Aportaciones a municipios (para la ejecución descentralizada de programas).
+
+-   Inversión pública y programas sociales (obra física y proyectos de desarrollo).
+
+-   Servicio de la deuda (pago de intereses y capital).
+
+-   Otros conceptos: gestión de inventarios, servicios generales, compra de activos, disponibilidades, provisiones financieras y gastos misceláneos.
+
+# Carga y preparación de los datos
+
+```{r}
+#| code-fold: true
+#| message: false
+#| warning: false
+
+# Lectura de todos los CSV del directorio de datos
+archivos_csv <- list.files("./conjunto_de_datos", pattern = "\\.csv$", full.names = TRUE)
+
+# Unir en un único data.frame, guardando el nombre del archivo origen
+df <- archivos_csv |>
+  set_names(nm = archivos_csv) |>
+  map_dfr(read_csv, .id = "origen")
+
+# Identificar columnas de texto y convertir a factor para consistencia
+cols_texto <- df %>% dplyr::select(dplyr::where(is.character)) |> names()
+df <- df |> mutate(across(all_of(cols_texto), as_factor))
+
+library(dplyr)
+library(stringi)    # para normalizar acentos (si no está instalado, usa stringr)
+# Normaliza nombres: quitar espacios y normalizar acentos
+names(df) <- trimws(names(df))
+# opcional: normalizar acentos para detección
+names_norm <- stringi::stri_trans_general(names(df), "Latin-ASCII")
+
+# Variables auxiliares
+df <- df |>  mutate(ANIO_f = as_factor(ANIO), VALOR_mn = VALOR / 1e6)
+df <- df |> rename(CVE_ENT = ID_ENTIDAD)
+
+# Información de entidades (metadatos)
+meta_ent <- read_csv("tc_entidad.csv") |> mutate(across(everything(), as_factor))
+meta_ent$ZONA <- factor(meta_ent$ZONA, levels = c("NORTE", "CENTRO", "SUR"))
+
+# Unir metadatos con el conjunto principal
+df <- left_join(df, meta_ent, by = c("CVE_ENT"))
+
+# Simplificar columnas innecesarias
+df <- df |> select(-origen, -PROD_EST, -COBERTURA, -ESTATUS)
+
+# Capa geográfica con entidades (para mapas)
+map_ent <- st_read("data_nacional/00ent.shp", options = "ENCODING=LATIN1", quiet = TRUE)
+map_ent <- left_join(map_ent, meta_ent, by = "CVE_ENT")
+
+# Mensajes de resumen
+cat("Años disponibles:", paste(unique(df$ANIO_f), collapse = ", "), "\n")
+cat("Número de entidades:", length(unique(df$CVE_ENT)), "\n")
+cat("Temas presentes:", paste(unique(df$TEMA), collapse = ", "), "\n")
+cat("Categorías:", paste(unique(df$CATEGORIA), collapse = ", "), "\n\n")
+```
+
+# Exploración inicial y recategorización
+
+En esta sección se filtra el subconjunto de "Egresos" y se agrupan las categorías en clases amplias (corriente, capital, servicio de deuda, transferencias/resto y otros) para facilitar el análisis comparativo.
+
+```{r}
+#| code-fold: true
+
+eg <- df |> filter(TEMA == "Egresos", CATEGORIA == "Capítulo")
+
+eg <- eg |> 
+  mutate(
+    RUBRO = case_when(
+      str_detect(DESCRIPCION_CATEGORIA, "Servicios personales|Materiales|Servicios generales|Gasto corriente") ~ "Corriente",
+      str_detect(DESCRIPCION_CATEGORIA, "Bienes muebles|Inversión pública|Inversión financiera|Gasto de capital") ~ "Capital",
+      str_detect(DESCRIPCION_CATEGORIA, "Deuda pública|Servicio de la deuda") ~ "Deuda",
+      str_detect(DESCRIPCION_CATEGORIA, "Transferencias|Participaciones|Otros egresos") ~ "Transferencias",
+      TRUE ~ "Otros"
+    ),
+    RUBRO = factor(RUBRO, levels = c("Corriente", "Capital", "Deuda", "Transferencias", "Otros"))
+  )
+
+# Agregación por año y entidad
+agg_eg <- eg |> 
+  group_by(ANIO, CVE_ENT, NOM_ENT, ABR_ENT, ZONA, RUBRO, ANIO_f) |> 
+  summarise(
+    VALOR = sum(VALOR, na.rm = TRUE),
+    VALOR_mn = sum(VALOR_mn, na.rm = TRUE),
+    .groups = "drop"
+  ) |> 
+  group_by(ANIO, CVE_ENT, NOM_ENT) |> 
+  mutate(
+    total_estado_ano = sum(VALOR_mn, na.rm = TRUE),
+    pct_anual = (VALOR_mn / total_estado_ano) * 100
+  ) |> 
+  ungroup() |> 
+  select(ANIO, CVE_ENT, VALOR, ANIO_f, VALOR_mn, pct_anual, NOM_ENT, ABR_ENT, ZONA, RUBRO)
+
+# Convertir a formato ancho para comparaciones entre rubros
+eg_wide <- agg_eg %>%
+  mutate(RUBRO = str_replace_all(as.character(RUBRO), "[ /]", "_")) %>%
+  pivot_wider(names_from = RUBRO, values_from = c(VALOR_mn, pct_anual), names_sep = "_") %>%
+  janitor::clean_names()
+
+# Guardar columnas relevantes si existen
+cols_deseadas <- intersect(c(
+  "anio", "cve_ent", "anio_f", "nom_ent", "abr_ent", "zona",
+  "corriente_valor_mn", "corriente_pct_anual",
+  "capital_valor_mn", "capital_pct_anual",
+  "deuda_valor_mn", "deuda_pct_anual",
+  "transferencias_valor_mn", "transferencias_pct_anual"
+), names(eg_wide))
+
+if(length(cols_deseadas) > 0){
+  eg_wide <- eg_wide |> select(all_of(cols_deseadas))
+}
+
+# Tabla resumen de estructura
+resumen_tabla <- eg |> group_by(TEMA, CATEGORIA, ABR_ENT) |> 
+  summarise(
+    registros = n(),
+    total_miles_mill = sum(VALOR, na.rm = TRUE) / 1e9,
+    .groups = "drop"
+  ) |> arrange(TEMA, CATEGORIA, ABR_ENT)
+
+kable(resumen_tabla, 
+      col.names = c("Tema", "Categoría", "Entidad", "Registros", "Total (Miles Mill. MXN)"),
+      digits = 2,
+      caption = "Resumen de registros y montos (EFIPEM, 2013-2023)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+# Visualizaciones territoriales
+
+## Mapa: total acumulado por entidad (2013–2023)
+
+```{r}
+#| code-fold: true
+#| fig-width: 8
+#| fig-height: 6
+
+totales_ent <- resumen_tabla |> select(ABR_ENT, total_miles_mill)
+map_data_tot <- left_join(map_ent, totales_ent, by = "ABR_ENT")
+
+ggplot(map_data_tot) +
+  geom_sf(aes(fill = total_miles_mill), color = "gray60", size = 0.4) +
+  labs(
+    title = "Egresos acumulados por estado (2013–2023)",
+    subtitle = "Miles de millones de pesos",
+    caption = "Fuente: INEGI - EFIPEM",
+    fill = ""
+  ) +
+  scale_fill_viridis_c(labels = comma) +
+  theme_void() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    plot.subtitle = element_text(size = 11),
+    plot.caption = element_text(size = 9)
+  )
+```
+
+> Nota: al excluir entidades con valores atípicos (por ejemplo, Estado de México) la distribución entre los demás estados resulta más homogénea.
+
+## Composición por categoría (por entidad)
+
+```{r}
+#| code-fold: true
+#| fig-width: 10
+#| fig-height: 10
+
+comp_por_categoria <- eg |> 
+  group_by(NOM_ENT, ABR_ENT, DESCRIPCION_CATEGORIA) |> 
+  summarise(valor_cat = sum(VALOR_mn, na.rm = TRUE), .groups = "drop") |> 
+  group_by(NOM_ENT, ABR_ENT) |> 
+  mutate(total_ent = sum(valor_cat), pct = (valor_cat / total_ent) * 100) |> 
+  ungroup()
+
+ggplot(comp_por_categoria |> mutate(label = ifelse(pct >= 1, paste0(round(pct, 1), "%"), "")),
+       aes(x = reorder(ABR_ENT, total_ent), y = pct, fill = DESCRIPCION_CATEGORIA)) +
+  geom_col(position = "stack") +
+  geom_text(aes(label = label), position = position_stack(vjust = 0.5), size = 3.5, color = "white") +
+  coord_flip() +
+  scale_fill_viridis_d(option = "magma") +
+  labs(
+    title = "Estructura porcentual del gasto por estado",
+    subtitle = "Participación por capítulo (etiquetas para >=1%)",
+    x = "Entidad",
+    y = "Porcentaje (%)",
+    fill = "Capítulo"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+# Gasto de capital: mapas y distribución
+
+## Mapa: monto acumulado de gasto de capital (2013–2023)
+
+```{r}
+#| code-fold: true
+#| fig-width: 8
+#| fig-height: 6
+cap_totales <- agg_eg |> filter(RUBRO == "Capital") |> 
+  group_by(CVE_ENT, ABR_ENT) |> summarise(cap_mn = sum(VALOR_mn, na.rm = TRUE), .groups = "drop")
+
+map_cap <- left_join(map_ent, cap_totales, by = "CVE_ENT")
+
+ggplot(map_cap) +
+  geom_sf(aes(fill = cap_mn), color = "gray70", size = 0.3) +
+  labs(
+    title = "Gasto de capital acumulado por estado (2013–2023)",
+    subtitle = "Millones de pesos (sumatoria del período)",
+    fill = "Capital (Millones)",
+    caption = "Fuente: EFIPEM"
+  ) +
+  scale_fill_viridis_c(labels = scales::comma) +
+  theme_void()
+```
+
+## Mapa: proporción de capital respecto al total del periodo
+
+```{r}
+#| code-fold: true
+#| fig-width: 8
+#| fig-height: 6
+
+pct_cap <- agg_eg |> 
+  group_by(CVE_ENT, NOM_ENT) |> 
+  summarise(
+    total_periodo = sum(VALOR_mn, na.rm = TRUE),
+    total_cap = sum(VALOR_mn[RUBRO == "Capital"], na.rm = TRUE),
+    .groups = "drop"
+  ) |> mutate(pct_cap = (total_cap / total_periodo) * 100)
+
+map_pct_cap <- left_join(map_ent, pct_cap, by = "CVE_ENT")
+
+ggplot(map_pct_cap) +
+  geom_sf(aes(fill = pct_cap), color = "gray60", size = 0.3) +
+  labs(
+    title = "Porcentaje de gasto de capital sobre el total (2013–2023)",
+    subtitle = "Porcentaje del total de egresos por entidad",
+    fill = "Capital (%)",
+    caption = "Fuente: EFIPEM"
+  ) +
+  scale_fill_viridis_c(labels = scales::percent_format(scale = 1)) +
+  theme_void()
+```
+
+# Resumen agregados por tipo de gasto
+
+```{r}
+#| code-fold: true
+
+tabla_rubro <- eg |> 
+  group_by(RUBRO) |> 
+  summarise(total_mn = sum(VALOR_mn, na.rm = TRUE), .groups = "drop") |> 
+  mutate(pct = (total_mn / sum(total_mn)) * 100,
+         valor_bill = total_mn / 1e6) |> arrange(desc(total_mn))
+
+tabla_rubro %>%
+  mutate(
+    `Valor (Millones MXN)` = format(round(total_mn, 0), big.mark = ",", scientific = FALSE),
+    `Valor (Billones MXN)` = format(round(valor_bill, 2), nsmall = 2),
+    `Porcentaje (%)` = format(round(pct, 1), nsmall = 1)
+  ) %>%
+  select(`Rubro` = RUBRO, `Valor (Millones MXN)`, `Valor (Billones MXN)`, `Porcentaje (%)`) %>%
+  kable(caption = "Distribución agregada por rubro (2013–2023)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+# Evolución temporal por rubro
+
+```{r}
+#| code-fold: true
+
+tend_rubros <- agg_eg |> group_by(ANIO, RUBRO) |> summarise(total = sum(VALOR_mn, na.rm = TRUE), .groups = "drop")
+
+ggplot(tend_rubros, aes(x = ANIO, y = total, color = RUBRO, group = RUBRO)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  scale_color_viridis_d(option = "turbo") +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = "Tendencia anual de los rubros del gasto (agregado nacional)",
+    x = "Año",
+    y = "Millones de pesos",
+    color = "Rubro"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+# Ejemplos por entidad: composición temporal
+
+```{r}
+#| code-fold: true
+#| fig-width: 10
+#| fig-height: 7
+
+# Jalisco
+ggplot(agg_eg |> filter(ABR_ENT == "JAL"), aes(x = ANIO_f, y = pct_anual, fill = RUBRO)) +
+  geom_col(position = "stack") +
+  geom_text(aes(label = ifelse(pct_anual >= 5, paste0(round(pct_anual, 1), "%"), "")),
+            position = position_stack(vjust = 0.5), size = 3.5, color = "white") +
+  coord_flip() +
+  scale_fill_viridis_d(option = "turbo") +
+  labs(title = "Composición porcentual de egresos - Jalisco", x = "Año", y = "Porcentaje (%)") +
+  theme_minimal()
+
+# Nuevo León
+ggplot(agg_eg |> filter(ABR_ENT == "NL"), aes(x = ANIO_f, y = pct_anual, fill = RUBRO)) +
+  geom_col(position = "stack") +
+  geom_text(aes(label = ifelse(pct_anual >= 5, paste0(round(pct_anual, 1), "%"), "")),
+            position = position_stack(vjust = 0.5), size = 3.5, color = "white") +
+  coord_flip() +
+  scale_fill_viridis_d(option = "turbo") +
+  labs(title = "Composición porcentual de egresos - Nuevo León", x = "Año", y = "Porcentaje (%)") +
+  theme_minimal()
+```
+
+# Análisis de la proporción de inversión (Gasto de capital)
+
+```{r}
+#| code-fold: true
+# Boxplot de proporciones de capital por estado
+ggplot(agg_eg |> filter(RUBRO == "Capital"), aes(x = reorder(ABR_ENT, pct_anual, FUN = mean), y = pct_anual, fill = ABR_ENT)) +
+  geom_boxplot() +
+  scale_fill_viridis_d(option = "turbo") +
+  labs(title = "Distribución del gasto de capital como % del total por estado (2013–2023)",
+       x = "Entidad", y = "Porcentaje (%)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+## Prueba ANOVA y post-hoc (Tukey)
+
+```{r}
+#| code-fold: true
+#| fig-width: 12
+#| fig-height: 6
+
+aov_cap <- aov(pct_anual ~ ABR_ENT, data = agg_eg |> filter(RUBRO == "Capital"))
+
+cat("Resumen ANOVA:\n")
+print(summary(aov_cap))
+
+cat("\nResultados post-hoc (Tukey):\n")
+tuk <- glht(aov_cap, linfct = mcp(ABR_ENT = "Tukey"))
+print(summary(tuk))
+```
+
+# Correlaciones entre rubros
+
+```{r}
+#| code-fold: true
+#| fig-width: 12
+#| fig-height: 6
+
+# Selección de columnas numéricas relevantes en eg_wide (si existen)
+vars_corr <- eg_wide %>% select(where(is.numeric))
+if(ncol(vars_corr) > 1){
+  M <- cor(vars_corr, use = "complete.obs")
+  corrplot(M, method = "color", type = "upper", order = "hclust",
+           tl.col = "black", tl.srt = 45, addCoef.col = "black", number.cex = 0.7,
+           title = "Matriz de correlación entre variables de gasto", mar = c(0,0,2,0))
+} else {
+  cat("No hay suficientes variables numéricas en eg_wide para calcular correlación.\n")
+}
+```
+
+# Conclusiones
+
+El análisis de la década 2013-2023 revela que la mayor proporción del gasto estatal se destina a rubros corrientes, como nómina, servicios y transferencias, mientras que la inversión en capital representa una porción menor en la mayoría de los estados. Al excluir entidades con un peso económico muy destacado (como el Estado de México), es posible apreciar con mayor nitidez las diferencias en los patrones de gasto entre el resto de las jurisdicciones.
